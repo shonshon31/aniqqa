@@ -21,6 +21,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body className={`${inter.variable} font-sans antialiased`}>
         {children}
+        <footer className="fixed inset-x-0 bottom-2 z-30 text-center text-[10px] text-white/35">
+          niqqa shon
+        </footer>
       </body>
     </html>
   );
