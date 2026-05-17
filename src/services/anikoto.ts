@@ -7,8 +7,10 @@ const API_BASE = process.env.ANIKOTO_API_BASE ?? "https://anikotoapi.site";
 const LIST_TTL = 1000 * 60 * 5;
 const DETAILS_TTL = 1000 * 60 * 15;
 const CATALOG_TTL = 1000 * 60 * 60;
+const SEARCH_TTL = 1000 * 60 * 60;
 const CATALOG_PER_PAGE = 100;
 const CATALOG_SCAN_PAGES = Number(process.env.ANIKOTO_CATALOG_SCAN_PAGES ?? 50);
+const DEEP_SEARCH_MAX_PAGES = Number(process.env.ANIKOTO_DEEP_SEARCH_MAX_PAGES ?? 120);
 
 type RawAnime = Record<string, unknown>;
 type RawEpisode = Record<string, unknown>;
@@ -42,14 +44,45 @@ export async function getAnimeDetails(id: string): Promise<AnimeDetails> {
 }
 
 export async function searchAnime(query: string, page = 1, perPage = 24): Promise<PaginatedAnime> {
-  const all = await getCatalogAnime();
   const term = query.trim().toLowerCase();
-  const matches = term
-    ? all.items.filter((item) => {
-        const haystack = [item.title, item.slug, item.synopsis, item.status, item.year, ...item.genres].join(" ").toLowerCase();
-        return haystack.includes(term);
-      })
-    : all.items;
+  if (term) {
+    return deepSearchAnime(term, page, perPage);
+  }
+
+  const all = await getCatalogAnime();
+  const start = (page - 1) * perPage;
+  const items = all.items.slice(start, start + perPage);
+
+  return {
+    items,
+    pagination: {
+      page,
+      perPage,
+      totalItems: all.items.length,
+      totalPages: Math.max(1, Math.ceil(all.items.length / perPage)),
+      hasNextPage: start + perPage < all.items.length
+    }
+  };
+}
+
+export async function deepSearchAnime(query: string, page = 1, perPage = 24): Promise<PaginatedAnime> {
+  const matches = await cached(`search:${query}`, SEARCH_TTL, async () => {
+    const firstPage = await getRecentAnimePage(1, CATALOG_PER_PAGE);
+    const totalPages = firstPage.pagination.totalPages ?? DEEP_SEARCH_MAX_PAGES;
+    const pagesToFetch = Math.max(1, Math.min(DEEP_SEARCH_MAX_PAGES, totalPages));
+    const byId = new Map<string, AnimeSummary>();
+
+    addMatches(firstPage.items, query, byId);
+
+    for (let pageNumber = 2; pageNumber <= pagesToFetch; pageNumber += 1) {
+      const result = await getRecentAnime(pageNumber, CATALOG_PER_PAGE);
+      addMatches(result.items, query, byId);
+
+      if (byId.size >= 75) break;
+    }
+
+    return Array.from(byId.values()).sort((a, b) => rankSearchResult(b, query) - rankSearchResult(a, query));
+  });
 
   const start = (page - 1) * perPage;
   const items = matches.slice(start, start + perPage);
@@ -105,6 +138,41 @@ async function getRecentAnimePage(page: number, perPage: number): Promise<Pagina
   const url = `${API_BASE}/recent-anime?page=${page}&per_page=${perPage}`;
   const data = await fetchJson<Record<string, unknown>>(url);
   return normalizeList(data, page, perPage);
+}
+
+function addMatches(items: AnimeSummary[], query: string, byId: Map<string, AnimeSummary>) {
+  items.forEach((item) => {
+    if (animeMatchesQuery(item, query)) byId.set(item.id, item);
+  });
+}
+
+function animeMatchesQuery(item: AnimeSummary, query: string) {
+  const normalizedQuery = normalizeSearchText(query);
+  const terms = normalizedQuery.split(" ").filter(Boolean);
+  const haystack = normalizeSearchText([item.title, item.slug, item.synopsis, item.status, item.year, ...item.genres].join(" "));
+
+  return terms.every((term) => haystack.includes(term));
+}
+
+function rankSearchResult(item: AnimeSummary, query: string) {
+  const title = normalizeSearchText(item.title);
+  const normalizedQuery = normalizeSearchText(query);
+  let score = item.rating ?? 0;
+
+  if (title === normalizedQuery) score += 100;
+  else if (title.startsWith(normalizedQuery)) score += 60;
+  else if (title.includes(normalizedQuery)) score += 35;
+
+  return score;
+}
+
+function normalizeSearchText(value: string) {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function normalizeList(data: Record<string, unknown>, page: number, perPage: number): PaginatedAnime {
